@@ -10,6 +10,14 @@
 #include <ArduinoJson.h>
 #include <msp430.h>
 #include <HardwareSerial.h>
+#include <Energia.h>
+
+// Override the enableXtal function.
+void enableXtal()
+{
+	// Do nothing. We don't have a crystal.
+}
+
 
 #define TEMPINT 15
 #define VIN_DISABLE 29
@@ -35,7 +43,7 @@ typedef struct info_t {
   unsigned char revision;               //< What board revision this is.
   unsigned int centidegrees_per_count;  //< Count conversion (0.01 C/count)
   unsigned int temperature_offset;      //< Offset (in 0.01 C) of temperature.
-  unsigned int heater_params[6];        //< Heater parameters. Min temp (0), current setting (1), max wait time (2), turn-off delay time (3), PID defaults (4, 5, 6).
+  unsigned int heater_params[7];        //< Heater parameters. Min temp (0), current setting (1), max wait time (2), turn-off delay time (3), PID defaults (4, 5, 6).
 } info_t;
 
 info_t *my_info = (info_t *) 0x1800;
@@ -74,13 +82,13 @@ unsigned int waitingTime;
 
 // Heater parameter defaults.
 
-// Minimum low temp before we wait.
-#define DEFAULT_TEMPERATURE_TOO_LOW 3000
+// Minimum low temp before we wait (above -6000)
+#define DEFAULT_TEMPERATURE_TOO_LOW 2000
 // Current output when too low.
 #define DEFAULT_HEATER_CURRENT 500
 // Half-seconds to wait before just trying a turn on (1 hour).
 #define DEFAULT_MAX_HEAT_WAIT_TIME 7200
-// Half-seconds to wait from temp above -40 to heater-off.
+// Half-seconds to wait from temp above TEMPERATURE_TOO_LOW to heater-off.
 #define DEFAULT_PID_WAIT_TIME 600
 // Default P (0.5)
 #define DEFAULT_HEATER_P 128
@@ -215,6 +223,7 @@ void setup()
 	unsigned int tmp2;
 	unsigned int delta;
 	int curTemp;
+	int targetTemp;
 
 	adc10b_calibration_t *adc_calib;
 
@@ -225,15 +234,29 @@ void setup()
 		digitalWrite(VIN_DISABLE, 0);
 		digitalWrite(EN_3V3, 0);
 		state = STATE_BOOT;
+		// Actually drive the outputs.
+		pinMode(VIN_DISABLE, OUTPUT);
+		pinMode(EN_3V3, OUTPUT);
+
+		// Flash an LED to let everyone know we're in a power-on situation.
+		digitalWrite(RED, 0);
+		pinMode(RED, OUTPUT);
+		delay(100);
+		digitalWrite(RED, 1);
+		delay(100);
+		digitalWrite(RED, 0);
+		delay(100);
+		digitalWrite(RED, 1);
+		pinMode(RED, INPUT);
 	} else {
-    // Keep power on.
-    digitalWrite(VIN_DISABLE, 1);
-    digitalWrite(EN_3V3, 1);
+		// Keep power on.
+		digitalWrite(VIN_DISABLE, 1);
+		digitalWrite(EN_3V3, 1);
 		state = STATE_READY;
+		// Actually drive the outputs.
+		pinMode(VIN_DISABLE, OUTPUT);
+		pinMode(EN_3V3, OUTPUT);
 	}
-  // Actually drive the outputs.
-  pinMode(VIN_DISABLE, OUTPUT);
-  pinMode(EN_3V3, OUTPUT);
 
   // Have we ever been programmed? If not, set it up.
   if (my_info->signature != INFO_SIGNATURE) {
@@ -305,8 +328,10 @@ void setup()
 									 my_info->heater_params[HEATER_D]);
     heaterPID.SetOutputLimits(1500, 4096);
     curTemp = readTemperature();
-    if (curTemp < ((int) my_info->heater_params[TEMPERATURE_TOO_LOW])) {
-  	  heaterPID.setpoint = my_info->heater_params[HEATER_CURRENT];
+    targetTemp = my_info->heater_params[TEMPERATURE_TOO_LOW];
+    targetTemp = targetTemp - 6000;
+    if (curTemp <= targetTemp) {
+      heaterPID.setpoint = my_info->heater_params[HEATER_CURRENT];
   	  state = STATE_HEATING;
     } else {
   	  heaterPID.setpoint = 0;
@@ -330,6 +355,7 @@ void setup()
 
   serialTime = 0;
   computeTime = millis() + COMPUTE_PERIOD;
+
 }
 
 void loop()
@@ -352,6 +378,7 @@ void loop()
   
   if ((long) (millis() - serialTime) > 0)  {
   	int temperature;
+  	int target;
   	unsigned int vin;
   	unsigned int v15;
 
@@ -393,8 +420,10 @@ void loop()
     }
 
     // State machine.
+    target = my_info->heater_params[TEMPERATURE_TOO_LOW];
+    target = target - 6000;
   	if (state == STATE_HEATING) {
-  		if (temperature >= ((int) my_info->heater_params[TEMPERATURE_TOO_LOW])) {
+  		if (temperature >= target) {
   			state = STATE_READY_WAIT_OFF;
   			powerTurnOn();
   			waitingTime = 0;
@@ -413,8 +442,8 @@ void loop()
   			waitingTime = 0;
   		} else waitingTime++;
   	} else if (state == STATE_TIMED_OUT) {
-      if (temperature >= ((int) my_info->heater_params[TEMPERATURE_TOO_LOW])) {
-        state = STATE_READY_WAIT_OFF;
+      if (temperature >= target) {
+    	state = STATE_READY_WAIT_OFF;
         waitingTime = 0;
       }
   	}
