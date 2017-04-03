@@ -11,6 +11,7 @@
 #include <msp430.h>
 #include <HardwareSerial.h>
 #include <Energia.h>
+#include <Wire.h>
 
 // Override the enableXtal function.
 void enableXtal()
@@ -26,6 +27,7 @@ void enableXtal()
 #define HEATER 22
 #define GREEN 10
 #define RED 9
+#define I2C_INT 15
 
 #define CURRENT A1
 #define MON_15V A8
@@ -90,8 +92,8 @@ unsigned int waitingTime;
 #define DEFAULT_MAX_HEAT_WAIT_TIME 7200
 // Half-seconds to wait from temp above TEMPERATURE_TOO_LOW to heater-off.
 #define DEFAULT_PID_WAIT_TIME 600
-// Default P (0.5)
-#define DEFAULT_HEATER_P 128
+// Default P (0.25)
+#define DEFAULT_HEATER_P 64
 // Default I (0.25)
 #define DEFAULT_HEATER_I 64
 // Default D (0)
@@ -129,6 +131,8 @@ typedef struct adc_calibration {
 	unsigned int temp85_2v5;			//< Raw reading of temperature sensor at 85 C using 2.5V internal reference.
 } adc10b_calibration_t;
 
+adc10b_calibration_t *__attribute__((section (".noinit"))) adc_calib;
+
 // Die record tags.
 typedef struct die_record {
 	unsigned char tag;					//< Identifier tag of the die record block.
@@ -138,6 +142,7 @@ typedef struct die_record {
 	unsigned int ypos;					//< Die Y position.
 	unsigned int test_results;			//< Test results.
 } die_record_t;
+die_record_t *__attribute__((section (".noinit"))) die_record;
 
 #define TLV_START (0x1A08)
 #define TLV_ADC10BCAL (0x13)
@@ -217,6 +222,43 @@ long readCurrent() {
 	return val;
 }
 
+int8_t readOnboardTemperatureSensor() {
+	Wire.beginTransmission(0x48);
+	Wire.write(0x00);
+	Wire.endTransmission();
+	Wire.requestFrom(0x48, 1);
+	if (Wire.available()) return Wire.read();
+	else return 127;
+}
+
+int8_t readOffboardTemperatureSensor() {
+	Wire.beginTransmission(0x48);
+	Wire.write(0x01);
+	Wire.endTransmission();
+	Wire.requestFrom(0x48, 1);
+	if (Wire.available()) return Wire.read();
+	else return 127;
+}
+
+void waitUntilTempSensorReady() {
+	unsigned int ntries;
+
+	Wire.beginTransmission(0x48);
+	// Disable all interrupts except data ready.
+	Wire.write(0x4);
+	Wire.write(0x80);
+	Wire.endTransmission();
+	// wait a little bit for the pullup
+	__delay_cycles(100);
+	// The conversion should take approximately 1 second.
+	// We'll wait until at least 2 seconds.
+	ntries = 0;
+	while (digitalRead(I2C_INT) && ntries < 1000) {
+		delay(2);
+		ntries++;
+	}
+}
+
 void setup()
 {
 	unsigned char *tmp;
@@ -224,8 +266,6 @@ void setup()
 	unsigned int delta;
 	int curTemp;
 	int targetTemp;
-
-	adc10b_calibration_t *adc_calib;
 
 	// Check immediately the state of VIN_DISABLE. If it's low, that means we're either at power-on or
 	// power was previously disabled anyway.
@@ -320,6 +360,8 @@ void setup()
   digitalWrite(RED, 1);
   pinMode(GREEN, OUTPUT);
   pinMode(RED, OUTPUT);
+  pinMode(I2C_INT, INPUT_PULLUP);
+  Wire.begin();
 
   // Initial state machine run.
   if (state == STATE_BOOT) {
@@ -327,9 +369,12 @@ void setup()
     								 my_info->heater_params[HEATER_I],
 									 my_info->heater_params[HEATER_D]);
     heaterPID.SetOutputLimits(1500, 4096);
-    curTemp = readTemperature();
+
+    waitUntilTempSensorReady();
+
+    curTemp = readOnboardTemperatureSensor();
     targetTemp = my_info->heater_params[TEMPERATURE_TOO_LOW];
-    targetTemp = targetTemp - 6000;
+    targetTemp = targetTemp - 60;
     if (curTemp <= targetTemp) {
       heaterPID.setpoint = my_info->heater_params[HEATER_CURRENT];
   	  state = STATE_HEATING;
@@ -356,6 +401,8 @@ void setup()
   serialTime = 0;
   computeTime = millis() + COMPUTE_PERIOD;
 
+  adc_calib = (adc10b_calibration_t *) msp430_tag_find(TLV_ADC10BCAL);
+  die_record = (die_record_t *) msp430_tag_find(TLV_DIERECORD);
 }
 
 void loop()
@@ -381,10 +428,14 @@ void loop()
   	int target;
   	unsigned int vin;
   	unsigned int v15;
+  	int8_t onboard;
+  	int8_t offboard;
 
   	temperature = readTemperature();
   	vin = readVin();
   	v15 = read15V();
+  	onboard = readOnboardTemperatureSensor();
+  	offboard = readOffboardTemperatureSensor();
 
     if (serial_running) {
     	Serial1.print("{\"pid\":[");
@@ -395,6 +446,10 @@ void loop()
     	Serial1.print(heaterPID.output);
     	Serial1.print("],\"temps\":[");
     	Serial1.print(temperature);
+    	Serial1.print(",");
+    	Serial1.print(onboard);
+    	Serial1.print(",");
+    	Serial1.print(offboard);
     	Serial1.print("],\"volts\":[");
     	Serial1.print(vin);
     	Serial1.print(",");
@@ -408,8 +463,9 @@ void loop()
     	Serial.print(" ");
     	Serial.print(heaterPID.input);
     	Serial.print(" ");
-    	Serial.println(heaterPID.output);
-
+    	Serial.print(heaterPID.output);
+    	Serial.print(" ");
+    	Serial.println(heaterPID.ITerm());
     	Serial.print("temp ");
     	Serial.println(temperature);
 
@@ -421,9 +477,9 @@ void loop()
 
     // State machine.
     target = my_info->heater_params[TEMPERATURE_TOO_LOW];
-    target = target - 6000;
+    target = target - 60;
   	if (state == STATE_HEATING) {
-  		if (temperature >= target) {
+  		if (onboard >= target) {
   			state = STATE_READY_WAIT_OFF;
   			powerTurnOn();
   			waitingTime = 0;
@@ -442,7 +498,7 @@ void loop()
   			waitingTime = 0;
   		} else waitingTime++;
   	} else if (state == STATE_TIMED_OUT) {
-      if (temperature >= target) {
+      if (onboard >= target) {
     	state = STATE_READY_WAIT_OFF;
         waitingTime = 0;
       }
@@ -477,6 +533,7 @@ void parseJsonInput() {
 		unsigned int cur;
 		cur = root["current"].as<int>();
 		if (cur <= CURRENT_LIMIT && cur >= 0) {
+			if (!heaterPID.setpoint) heaterPID.Reset(heaterPID.input);
 			heaterPID.setpoint = cur;
 		}
 	}
@@ -485,8 +542,16 @@ void parseJsonInput() {
 		if (params.size() >= 2) {
 		  unsigned int idx = params[0];
 		  int val = params[1];
-		  if (idx < 6) {
+		  if (idx < 7) {
 			my_info->heater_params[idx] = val;
+		  }
+		  // If it's a heater PID parameter, we need to reset the PID.
+		  if (idx > 3) {
+			  analogWrite(HEATER, 0);
+			  heaterPID.Reset(heaterPID.input);
+			  heaterPID.SetTuningParametersRaw(my_info->heater_params[HEATER_P],
+				 							  my_info->heater_params[HEATER_I],
+											  my_info->heater_params[HEATER_D]);
 		  }
 		}
 		Serial1.print("{\"heaterparams\":[");
@@ -498,6 +563,24 @@ void parseJsonInput() {
 			  Serial1.print((int) my_info->heater_params[i]);
 		  }
 		}
+		Serial1.println("]}");
+	}
+	if (root.containsKey("calibration")) {
+		JsonArray& cals = root["calibration"];
+		if (cals.size() >= 2) {
+			unsigned int idx = cals[0];
+			unsigned int val = cals[1];
+			if (idx == 0) {
+				my_info->centidegrees_per_count = val;
+			}
+			else if (idx == 1) {
+				my_info->temperature_offset = val;
+			}
+		}
+		Serial1.print("{\"calibration\":[");
+		Serial1.print(my_info->centidegrees_per_count);
+		Serial1.print(",");
+		Serial1.print(my_info->temperature_offset);
 		Serial1.println("]}");
 	}
 }
@@ -513,3 +596,4 @@ void powerTurnOn() {
       serial_running = true;
     }
 }
+

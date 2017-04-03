@@ -46,6 +46,10 @@ public:
 		_lastInput = lastInput;
 	}
 
+	inline long ITerm() {
+		return _ITerm;
+	}
+
 	int input;
 	int output;
 	int setpoint;
