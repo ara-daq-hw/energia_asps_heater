@@ -85,7 +85,7 @@ unsigned int waitingTime;
 // Heater parameter defaults.
 
 // Minimum low temp before we wait (above -6000)
-#define DEFAULT_TEMPERATURE_TOO_LOW 2000
+#define DEFAULT_TEMPERATURE_TOO_LOW 20
 // Current output when too low.
 #define DEFAULT_HEATER_CURRENT 500
 // Half-seconds to wait before just trying a turn on (1 hour).
